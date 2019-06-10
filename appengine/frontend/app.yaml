@@ -1,0 +1,10 @@
+runtime: go111
+service: frontend
+
+handlers:
+  - url: /(.*\.(gif|png|jpeg|jpg|css|js|ico|map))$
+    static_files: dist/frontend/\1
+    upload: dist/frontend/(.*)
+  - url: /(.*)
+    static_files: dist/frontend/index.html
+    upload: dist/frontend/index.html

@@ -1,0 +1,215 @@
+version: 2.1
+
+## ----------------------------------------------------------------
+## anchors
+## ----------------------------------------------------------------
+anchors:
+  - working_directory: &working_directory ~/app
+  - frontend_working_directory: &frontend_working_directory appengine/frontend
+
+## ----------------------------------------------------------------
+## orbs
+## ----------------------------------------------------------------
+orbs:
+  # https://circleci.com/orbs/registry/orb/circleci/node
+  node: circleci/node@1.0.1
+  # https://circleci.com/orbs/registry/orb/circleci/gcp-cli
+  gcp-cli: circleci/gcp-cli@1.5.0
+
+## ----------------------------------------------------------------
+## executors
+## ----------------------------------------------------------------
+executors:
+  node-executor:
+    working_directory: *working_directory
+    docker:
+      - image: circleci/node:10.15.3-browsers
+  gcloud-executor:
+    working_directory: *working_directory
+    docker:
+    - image: google/cloud-sdk:latest
+
+## ----------------------------------------------------------------
+## commands
+## ----------------------------------------------------------------
+commands:
+  npm_ci:
+    description: "npm ci"
+    parameters:
+      frontend_dir:
+        default: *frontend_working_directory
+        type: string
+    steps:
+      - node/with-cache:
+          cache-key: "<< parameters.frontend_dir >>/package-lock.json"
+          cache-version: "{{ .Environment.CACHE_KEY }}"
+          dir: "~/.npm"
+          steps:
+            - run:
+                working_directory: *frontend_working_directory
+                command: npm ci
+          use-strict-cache: false
+  gcp_cli_initialize_develop:
+    description: "gcp cli initialize"
+    steps:
+      - gcp-cli/initialize:
+          gcloud-service-key: GCLOUD_SERVICE_KEY_DEVELOP
+          google-compute-zone: GOOGLE_COMPUTE_ZONE_DEVELOP
+          google-project-id: GOOGLE_PROJECT_ID_DEVELOP
+  gcp_cli_initialize_staging:
+    description: "gcp cli initialize"
+    steps:
+      - gcp-cli/initialize:
+          gcloud-service-key: GCLOUD_SERVICE_KEY_STAGING
+          google-compute-zone: GOOGLE_COMPUTE_ZONE_STAGING
+          google-project-id: GOOGLE_PROJECT_ID_STAGING
+  gcp_cli_initialize_master:
+    description: "gcp cli initialize"
+    steps:
+      - gcp-cli/initialize:
+          gcloud-service-key: GCLOUD_SERVICE_KEY_MASTER
+          google-compute-zone: GOOGLE_COMPUTE_ZONE_MASTER
+          google-project-id: GOOGLE_PROJECT_ID_MASTER
+
+## ----------------------------------------------------------------
+## jobs
+## ----------------------------------------------------------------
+jobs:
+  frontend-test:
+    executor: node-executor
+    steps:
+      - run: printenv
+      - run: node -v
+      - run: npm -v
+      - checkout
+      - npm_ci
+      - run:
+          name: lint
+          working_directory: *frontend_working_directory
+          command: npm run lint
+      - run:
+          name: test
+          working_directory: *frontend_working_directory
+          command: npm run test:ci
+          when: always
+      - run:
+          name: e2e
+          working_directory: *frontend_working_directory
+          command: npm run e2e
+          when: always
+      - run:
+          name: collect-test-data
+          working_directory: *frontend_working_directory
+          command: |
+            mkdir -p ~/tmp/test-results/
+            cp -pR reports/* ~/tmp/test-results/
+      - store_test_results:
+          path: ~/tmp/test-results
+      - store_artifacts:
+          path: ~/tmp/test-results
+
+  frontend-build:
+    parameters:
+      env:
+        default: "prod"
+        type: enum
+        enum: ["prod", "stg", "dev"]
+    executor: node-executor
+    steps:
+      - run: printenv
+      - run: node -v
+      - run: npm -v
+      - checkout
+      - npm_ci
+      - run:
+          name: build
+          working_directory: *frontend_working_directory
+          command: npm run build:<< parameters.env >>
+      - run: mkdir -p ~/tmp/workspace/<< parameters.env >>
+      - run:
+          name: build
+          working_directory: *frontend_working_directory
+          command: cp -r dist/ ~/tmp/workspace/<< parameters.env >>/
+      - persist_to_workspace:
+          root: ~/tmp/workspace/<< parameters.env >>
+          paths:
+            - dist
+
+  frontend-deploy:
+    parameters:
+      env:
+        default: "prod"
+        type: enum
+        enum: ["prod", "stg", "dev"]
+    executor: gcloud-executor
+    steps:
+      - run: printenv
+      - run: gcloud --version
+      - checkout
+      - attach_workspace:
+          at: ~/tmp/workspace/<< parameters.env >>
+      - run:
+          name: build
+          working_directory: *frontend_working_directory
+          command: cp -r ~/tmp/workspace/<< parameters.env >>/dist/ ./
+      - run:
+          name: deploy
+          working_directory: *frontend_working_directory
+          command: |
+            VERSION=$(git rev-parse --short=8 HEAD)
+            gcloud app deploy --quiet --version $VERSION --no-promote app.yaml
+
+## ----------------------------------------------------------------
+## workflows
+## ----------------------------------------------------------------
+workflows:
+  build-test:
+    jobs:
+      - frontend-test
+
+      - frontend-build:
+          env: "dev"
+          name: frontend-build-develop
+          requires:
+            - frontend-test
+          filters:
+            branches:
+              only: develop
+      - frontend-build:
+          env: "stg"
+          name: frontend-build-staging
+          requires:
+            - frontend-test
+          filters:
+            branches:
+              only: develop
+      - frontend-build:
+          env: "prod"
+          name: frontend-build-master
+          requires:
+            - frontend-test
+          filters:
+            branches:
+              only: master
+
+      - frontend-deploy:
+          env: "dev"
+          name: frontend-deploy-develop
+          pre-steps:
+            - gcp_cli_initialize_develop
+          requires:
+            - frontend-build-develop
+      - frontend-deploy:
+          env: "stg"
+          name: frontend-deploy-staging
+          pre-steps:
+            - gcp_cli_initialize_staging
+          requires:
+            - frontend-build-staging
+      - frontend-deploy:
+          env: "prod"
+          name: frontend-deploy-master
+          pre-steps:
+            - gcp_cli_initialize_master
+          requires:
+            - frontend-build-master
